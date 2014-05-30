@@ -381,7 +381,7 @@ main(int argc, char *argv[])
         
     if (geteuid() != ctx->uid) {
         /* Setuid-root operation protecting private config. */
-        if (ctx->config != NULL || ctx->duouser != NULL) {
+        if (ctx->config != NULL/* || ctx->duouser != NULL*/) {
             die("Only root may specify -c or -f");
         }
         if ((pw = getpwnam(DUO_PRIVSEP_USER)) == NULL) {
