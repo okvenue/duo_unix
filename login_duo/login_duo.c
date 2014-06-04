@@ -12,6 +12,7 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -33,6 +34,8 @@
 #endif
 #define DUO_CONF        DUO_CONF_DIR "/login_duo.conf"
 #define MOTD_FILE       "/etc/motd"
+#define DUO_SESSIONS_DIR        "/var/lib/duo"
+#define DUO_SESSION_SECONDS     60 * 5
 
 struct login_ctx {
     const char  *config;
@@ -40,6 +43,76 @@ struct login_ctx {
     const char  *host;
     uid_t        uid;
 };
+
+int debug = 0;
+
+static int
+duo_session_check(const char *user, const char *ip)
+{
+  int return_value;
+  time_t now;
+  struct stat session_stat;
+  char session_path[256];
+
+  snprintf(session_path, sizeof session_path, "%s/%s@%s", DUO_SESSIONS_DIR, user, ip);
+  if (debug) {
+    puts(session_path);
+  }
+
+  return_value = -1;
+
+  if (stat(session_path, &session_stat) != -1) {
+    time(&now);
+    if ((int)(now - session_stat.st_mtime) < DUO_SESSION_SECONDS) {
+      if (debug) {
+  puts("valid session");
+      }
+      return_value = 0;
+    }
+    else {
+      if (debug) {
+  puts("session expired: by time");
+      }
+    }
+  }
+  else {
+    if (debug) {
+      puts("session expired: failed to get stat");
+    }
+  }
+
+  return return_value;
+}
+
+static int
+duo_session_update(const char *user, const char *ip)
+{
+  char session_path[256];
+  FILE *session_file;
+  time_t now;
+  struct tm* now_info;
+  char formatted_time[256];
+
+  snprintf(session_path, sizeof session_path, "%s/%s@%s", DUO_SESSIONS_DIR, user, ip);
+
+  if ((session_file = fopen(session_path, "a")) != NULL) {
+    time(&now);
+    now_info = localtime(&now);
+    strftime(formatted_time, 256, "%Y:%m:%d %H:%M:%S", now_info);
+    fprintf(session_file, "%s\n", formatted_time);
+    fclose(session_file);
+    if (debug) {
+      puts("Updated session file");
+    }
+    return 0;
+  }
+  else {
+    if (debug) {
+      puts("Failed to open session file");
+    }
+    return -1;
+  }
+}
 
 static void
 die(const char *fmt, ...)
@@ -216,50 +289,57 @@ do_auth(struct login_ctx *ctx, const char *cmd)
 
     ret = EXIT_FAILURE;
     
-    for (i = 0; i < prompts; i++) {
-        code = duo_login(duo, duouser, host, flags,
-                    cfg.pushinfo ? cmd : NULL);
-        if (code == DUO_FAIL) {
-            duo_log(LOG_WARNING, "Failed Duo login",
-                duouser, host, duo_geterr(duo));
-            if ((flags & DUO_FLAG_SYNC) == 0) {
-                printf("\n");
-            }
-            /* The autopush failed, fall back to regular process */
-            if (cfg.autopush && i == 0) {
-                flags = 0;
-                duo_reset_conv_funcs(duo);
-            }
-            /* Keep going */
-            continue;
-        }
-        /* Terminal conditions */
-        if (code == DUO_OK) {
-            if ((p = duo_geterr(duo)) != NULL) {
-                duo_log(LOG_WARNING, "Skipped Duo login",
-                    duouser, host, p);
-            } else {
-                duo_log(LOG_INFO, "Successful Duo login",
-                    duouser, host, NULL);
-            }
-            if (cfg.motd && !headless) {
-                _print_motd();
-            }
-            ret = EXIT_SUCCESS;
-        } else if (code == DUO_ABORT) {
-            duo_log(LOG_WARNING, "Aborted Duo login",
-                duouser, host, duo_geterr(duo));
-        } else if (cfg.failmode == DUO_FAIL_SAFE &&
-                    (code == DUO_CONN_ERROR ||
-                     code == DUO_CLIENT_ERROR || code == DUO_SERVER_ERROR)) {
-            duo_log(LOG_WARNING, "Failsafe Duo login",
-                duouser, host, duo_geterr(duo));
-                        ret = EXIT_SUCCESS;
-        } else {
-            duo_log(LOG_ERR, "Error in Duo login",
-                duouser, host, duo_geterr(duo));
-        }
-        break;
+    if (duo_session_check(pw->pw_name, ip) != -1) {
+      duo_session_update(pw->pw_name, ip);
+      ret = EXIT_SUCCESS;
+    }
+    else {
+      for (i = 0; i < prompts; i++) {
+          code = duo_login(duo, duouser, host, flags,
+                      cfg.pushinfo ? cmd : NULL);
+          if (code == DUO_FAIL) {
+              duo_log(LOG_WARNING, "Failed Duo login",
+                  duouser, host, duo_geterr(duo));
+              if ((flags & DUO_FLAG_SYNC) == 0) {
+                  printf("\n");
+              }
+              /* The autopush failed, fall back to regular process */
+              if (cfg.autopush && i == 0) {
+                  flags = 0;
+                  duo_reset_conv_funcs(duo);
+              }
+              /* Keep going */
+              continue;
+          }
+          /* Terminal conditions */
+          if (code == DUO_OK) {
+              if ((p = duo_geterr(duo)) != NULL) {
+                  duo_log(LOG_WARNING, "Skipped Duo login",
+                      duouser, host, p);
+              } else {
+                  duo_log(LOG_INFO, "Successful Duo login",
+                      duouser, host, NULL);
+                  duo_session_update(pw->pw_name, ip);
+              }
+              if (cfg.motd && !headless) {
+                  _print_motd();
+              }
+              ret = EXIT_SUCCESS;
+          } else if (code == DUO_ABORT) {
+              duo_log(LOG_WARNING, "Aborted Duo login",
+                  duouser, host, duo_geterr(duo));
+          } else if (cfg.failmode == DUO_FAIL_SAFE &&
+                      (code == DUO_CONN_ERROR ||
+                       code == DUO_CLIENT_ERROR || code == DUO_SERVER_ERROR)) {
+              duo_log(LOG_WARNING, "Failsafe Duo login",
+                  duouser, host, duo_geterr(duo));
+                          ret = EXIT_SUCCESS;
+          } else {
+              duo_log(LOG_ERR, "Error in Duo login",
+                  duouser, host, duo_geterr(duo));
+          }
+          break;
+      }
     }
     duo_close(duo);
 
